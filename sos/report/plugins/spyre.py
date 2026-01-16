@@ -94,4 +94,20 @@ class Spyre(Plugin, IndependentPlugin):
             "/etc/security/limits.d/memlock.conf",
         ])
 
+        non_root_users = self.exec_cmd("awk -F: '$3 >= 1000 && $3 != 65534 {print $1}' /etc/passwd")
+        if non_root_users['status'] == 0:
+            for user in non_root_users['output'].splitlines():
+                if not user.strip():
+                    continue
+                command = "sudo -u "+ user + " "
+
+                validate_cmd = self.exec_cmd(command + "podman system df")
+                if validate_cmd['status'] != 0:
+                    continue
+
+                self.add_cmd_output([
+                    command + "podman system df",
+                    command + "podman system df -v",
+                ])
+
 # vim: set et ts=4 sw=4 :
