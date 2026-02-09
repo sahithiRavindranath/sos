@@ -44,14 +44,29 @@ class Podman(Plugin, RedHatPlugin, UbuntuPlugin):
                     'container produces stdout/stderr output. Use cautiously '
                     'when also using the \'all\' option.')),
         PluginOpt('size', default=False,
-                  desc='collect image sizes for podman ps')
+                  desc='collect image sizes for podman ps'),
+        PluginOpt('allusers', default=False,
+                  desc='collect for all users, including non root users')
     ]
 
     def setup(self):
-        self.add_cmd_tags({
-            'podman images': 'podman_list_images',
-            'podman ps': 'podman_list_containers'
-        })
+        users = ['root']
+        if self.get_option('allusers'):
+            non_root_users = self.exec_cmd("lslogins -u --noheadings")
+            if non_root_users['status'] == 0:
+                # parse the command output to get the user names
+                users = [
+                    # get 2nd string of line that has user name
+                    user.split()[1].strip()
+                    # split the user data into lines
+                    for user in non_root_users['output'].splitlines()
+                    if user.split()[1].strip()
+                ]
+
+        self.add_dir_listing([
+            '/etc/cni',
+            '/etc/containers'
+        ], recursive=True)
 
         subcmds = [
             'info',
@@ -68,57 +83,138 @@ class Podman(Plugin, RedHatPlugin, UbuntuPlugin):
             'system df -v',
         ]
 
-        self.add_cmd_output([f"podman {s}" for s in subcmds])
+        for user in users:
+            if not user:
+                continue
+            command = "sudo -u " + user
+            if user == 'root':
+                command = ""
+            else:
+                cmd = self.exec_cmd(f"{command} podman ps -aq")
+                # if command is not successful or no container running in
+                # a non root user session not collecting the  data.
+                if (cmd['status'] != 0
+                       or not cmd['output'].strip()):
+                    continue
 
-        # separately grab ps -s as this can take a *very* long time
-        if self.get_option('size'):
-            self.add_cmd_output('podman ps -as', priority=100)
+            self.add_cmd_tags({
+                f'{command} podman images': 'podman_list_images',
+                f'{command} podman ps': 'podman_list_containers'
+            })
 
-        self.add_dir_listing([
-            '/etc/cni',
-            '/etc/containers'
-        ], recursive=True)
-
-        pnets = self.collect_cmd_output('podman network ls',
-                                        tags='podman_list_networks')
-        if pnets['status'] == 0:
-            nets = [pn.split()[0] for pn in pnets['output'].splitlines()[1:]]
-            self.add_cmd_output([
-                f"podman network inspect {net}" for net in nets
-            ], subdir='networks', tags='podman_network_inspect')
-
-        containers = [
-            c[0] for c in self.get_containers(runtime='podman',
-                                              get_all=self.get_option('all'))
-        ]
-        images = self.get_container_images(runtime='podman')
-        volumes = self.get_container_volumes(runtime='podman')
-
-        for container in containers:
-            self.add_cmd_output(f"podman inspect {container}",
-                                subdir='containers',
-                                tags='podman_container_inspect')
-
-        for img in images:
-            name, img_id = img
-            insp = name if 'none' not in name else img_id
-            self.add_cmd_output(f"podman inspect {insp}", subdir='images',
-                                tags='podman_image_inspect')
             self.add_cmd_output(
-                f"podman image tree {insp}",
-                subdir='images/tree',
-                tags='podman_image_tree'
+                    [f"{command} podman {s}" for s in subcmds],
+                    subdir=f'{user}/'
             )
 
-        for vol in volumes:
-            self.add_cmd_output(f"podman volume inspect {vol}",
-                                subdir='volumes',
-                                tags='podman_volume_inspect')
+            # separately grab ps -s as this can take a *very* long time
+            if self.get_option('size'):
+                self.add_cmd_output(
+                        f'{command} podman ps -as',
+                        priority=100,
+                        subdir=f'{user}/'
+                )
 
-        if self.get_option('logs'):
-            for con in containers:
-                self.add_cmd_output(f"podman logs -t {con}",
-                                    subdir='containers', priority=50)
+            pnets = self.collect_cmd_output(
+                    f'{command} podman network ls',
+                    subdir=f'{user}/networks',
+                    tags='podman_list_networks'
+            )
+            if pnets['status'] == 0:
+                nets = [
+                    pn.split()[0]
+                    for pn in pnets['output'].splitlines()[1:]
+                ]
+                self.add_cmd_output(
+                    [
+                        f"{command} podman network inspect {net}"
+                        for net in nets
+                    ],
+                    subdir=f'{user}/networks',
+                    tags='podman_network_inspect'
+                )
+
+            if user == 'root':
+                containers = [
+                    c[0] for c in self.get_containers(runtime='podman',
+                                          get_all=self.get_option('all'))
+                ]
+                images = self.get_container_images(runtime=f'podman')
+                volumes = self.get_container_volumes(runtime=f'podman')
+            else:
+                # getting the containers, images and volumes info for non-root
+                # user as runtime fetches these info for root user only.
+                cmd = f"{command} podman ps"
+                if self.get_option('all'):
+                    cmd = f"{command} podman ps -a"
+                containers_data = self.exec_cmd(cmd)
+                containers = []
+                if containers_data['status'] == 0:
+                    # parse to get container id
+                    containers = [
+                        # get 1st column container id
+                        container.split()[0]
+                        # skip the heading line
+                        for container in containers_data['output']
+                                            .splitlines()[1:]
+                        if container.strip()
+                    ]
+
+                image_data = self.collect_cmd_output(
+                    f'{command} podman images --no-trunc', subdir=f'{user}/'
+                )
+                images = []
+                volumes = []
+                if image_data['status'] == 0:
+                    # parse to get the image data{name:tag,id}
+                    images = [
+                        (f"{image[0]}:{image[1]}", image[2])
+                        for image in (
+                            #split the each line into columns
+                            img.split()
+                            # split into lines and skip the heading line
+                            for img in image_data['output']
+                                                .strip()
+                                                .split("\n")[1:]
+                        )
+                    ]
+                vols = self.exec_cmd(
+                        f'{command} podman volume ls --format "{{{{.Name}}}}"'
+                )
+                if vols['status'] == 0:
+                    volumes = [
+                        # parse to get the volume names
+                        v for v in vols['output'].splitlines() if v.strip()
+                    ]
+
+            for container in containers:
+                self.add_cmd_output(f"{command} podman inspect {container}",
+                                    subdir=f'{user}/containers',
+                                    tags='podman_container_inspect')
+
+            for img in images:
+                name, img_id = img
+                insp = name if 'none' not in name else img_id
+                self.add_cmd_output(
+                    f"{command} podman inspect {insp}",
+                    subdir=f'{user}/images',
+                    tags='podman_image_inspect'
+                )
+                self.add_cmd_output(
+                    f"{command} podman image tree {insp}",
+                    subdir=f'{user}/images/tree',
+                    tags='podman_image_tree'
+                )
+
+            for vol in volumes:
+                self.add_cmd_output(f"{command} podman volume inspect {vol}",
+                                    subdir=f'{user}/volumes',
+                                    tags='podman_volume_inspect')
+
+            if self.get_option('logs'):
+                for con in containers:
+                    self.add_cmd_output(f"{command} podman logs -t {con}",
+                                    subdir=f'{user}/containers', priority=50)
 
     def postproc(self):
         # Attempts to match key=value pairs inside container inspect output
